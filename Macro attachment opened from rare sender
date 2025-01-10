@@ -1,0 +1,44 @@
+// Adjust the threshold based on your organisation.
+let RareSenderThreshold = 10;
+let LookupPeriod = 7d;
+let MacroExtensions = dynamic(['xlsm', 'xstm', 'docm', 'dotm', 'pptm', 'ppsm', 'xll', 'xlsb', 'doc', 'xsl', 'svg']);
+// If you also want to include older attachments use
+// let MacroExtensions = dynamic(['xlsm', 'xstm', 'docm', 'dotm', 'pptm', 'ppsm', 'xll', 'xlsb', 'doc', 'xsl', 'svg']);
+// Step 1
+let RareMacroSenders = EmailAttachmentInfo
+| where Timestamp > ago(30d)
+// Extract the file extension for each filename
+| extend FileExtension = tostring(extract(@'.*\.(.*)', 1, FileName))
+// Remove empty file extensions and SHA256 hashes, they will otherwise cause a lot of false positives
+| where isnotempty(FileExtension) and isnotempty(SHA256)
+// Filter only on marco extensions
+| where FileExtension in~ (MacroExtensions)
+| summarize TotalMacroAttachmentsSend = dcount(NetworkMessageId) by SenderObjectId
+// Filter on rare senders
+| where TotalMacroAttachmentsSend < RareSenderThreshold
+| project SenderObjectId;
+// Step 2
+let RecievedMacros = EmailAttachmentInfo
+| where Timestamp > ago(LookupPeriod)
+// Filter on rare senders. Senders that often user macro's are filtered.
+| where SenderObjectId in (RareMacroSenders)
+// Extract the file extension for each filename
+| extend FileExtension = tostring(extract(@'.*\.(.*)', 1, FileName))
+// Remove empty file extensions and SHA256 hashes, they will otherwise cause a lot of false positives
+| where isnotempty(FileExtension) and isnotempty(SHA256)
+// Filter only on marco extensions
+| where FileExtension in~ (MacroExtensions)
+| project SHA256;
+// Step 3
+DeviceFileEvents
+| where ActionType == 'FileCreated'
+// Search for devices that have FileEvents with macros recieved from emails.
+| where SHA256 in (RecievedMacros)
+| summarize TotalDevices = dcount(DeviceName), FileLocations = make_set(FolderPath) by SHA256
+// Collect the email events, to enrich the results. Step 4
+| join kind=inner (EmailAttachmentInfo | project RecipientEmailAddress, NetworkMessageId, SHA256) on $left.SHA256 == $right.SHA256
+| join kind=inner (EmailEvents | project SenderFromAddress, Subject, NetworkMessageId, EmailDirection) on $left.NetworkMessageId == $right.NetworkMessageId
+// Only search for inbound mail
+| where EmailDirection == 'Inbound'
+//| where RecipientEmailAddress == "XXX" // Replace xx with  the name of the user  
+| summarize ['Targeted Mailboxes'] = make_set(RecipientEmailAddress) by SHA256, TotalDevices, tostring(FileLocations), Subject, SenderFromAddress
